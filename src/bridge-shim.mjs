@@ -115,7 +115,17 @@ const INIT_RESPONSE_FALLBACK = () => ({
   models: [], account: {}, capabilities: CAPABILITIES, pid: process.pid,
 });
 const MODELS_FALLBACK = () => ({
-  models: [{ value: 'claude-bridge', displayName: 'Claude', description: '使用强大的 Claude Code 代理后端', modelId: 'claude-bridge', source: 'system', isDefault: true }],
+  models: [{
+    value: 'claude-bridge',
+    displayName: 'Claude',
+    description: '使用强大的 Claude Code 代理后端',
+    modelId: 'claude-bridge',
+    source: 'system',
+    isDefault: true,
+    // —— 视觉能力声明（千问办公前端通过 is_vl 或 capabilities.vision 判断）——
+    is_vl: true,
+    capabilities: { vision: true },
+  }],
 });
 
 // ---------- 参数解析 v2 ----------
@@ -541,6 +551,9 @@ function runSession(parsed) {
             description: m.description ?? 'Claude Code (bridge)',
             modelId: m.modelId ?? m.id ?? m.value ?? String(m),
             source: 'system', isDefault: m.isDefault ?? i === 0,
+            // —— 视觉能力注入：Claude 全系列支持 vision ——
+            is_vl: true,
+            capabilities: { vision: true },
           })) };
         }
         return MODELS_FALLBACK();
@@ -632,11 +645,18 @@ function runSession(parsed) {
   }
 }
 
-// claude 的 initialize 应答 → SDK 期望形状：补 capabilities / skills
+// claude 的 initialize 应答 → SDK 期望形状：补 capabilities / skills / 视觉能力
 function mergeInitializeResponse(resp) {
   const merged = { ...resp };
   if (!Array.isArray(merged.capabilities)) merged.capabilities = CAPABILITIES;
   if (!Array.isArray(merged.skills)) merged.skills = [];
+  // —— 视觉能力注入：Claude 全系列支持 vision，千问办公前端通过 is_vl / capabilities.vision 判断 ——
+  if (Array.isArray(merged.models)) {
+    merged.models = merged.models.map((m) => {
+      if (typeof m !== 'object' || m === null) return m;
+      return { ...m, is_vl: m.is_vl ?? true, capabilities: { vision: true, ...(m.capabilities ?? {}) } };
+    });
+  }
   return merged;
 }
 
