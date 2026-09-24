@@ -141,3 +141,48 @@
 - **影响**：`launchctl setenv` 只对之后启动的进程生效（已运行的千问办公需重启，与旧方案一致）；注入面从 per-app 扩大为 launchd 用户域全局（变量名专属本桥接，实际影响可控）；plist 写死 shim 绝对路径，仓库移动后需重新 `pnpm apply`。**抗 App 升级**：注入源在用户目录（`~/Library/LaunchAgents`），与 `/Applications/QwenWorkCN.app` 的 asar 替换、版本目录轮换、bundle id 变更全部解耦——千问办公升级只影响 App 本体，不会碰 LaunchAgent，也不会清 launchd 环境；旧方案 LSEnvironment 写在 App 偏好域里，App 换包名就失效，这是 D10 相较 D9 的核心收益。
 - **迁移**：旧版 LSEnvironment 残留（`cn.qwenwork.desktop.mac` 偏好域中的键，指向同一 shim 路径）已于 2026-08-22 在本机一次性清理（`defaults delete cn.qwenwork.desktop.mac LSEnvironment`），代码中不保留迁移清理逻辑。
 - **何时重新考虑**：千问办公后续版本**不再读 `QODER_CLI_PATH` / `QODERCLI_PATH` 这两个环境变量**（注入链路本身不受 App 升级影响，但若 App 移除挂点，任何注入方式都失效）；macOS 新系统版本限制 launchd 用户域环境注入；shim 所在仓库移动（plist 内路径失效）。
+
+## D11：会话语义适配（`--session-id` ↔ `--resume` 按 cwd 互转）
+
+- **问题**：v1 直通 `--session-id`/`--resume`，联调发现 qoder 与 claude 对这两个旗标的语义**完全相反**：
+  - qoder：`--session-id <X>` 幂等（X 已存在则续接），`--resume <X>` 容错（X 不存在则新建）。
+  - claude：`--session-id <X>` 仅新建（X 已存在 → `already in use` 退出 1），`--resume <X>` 仅续接（X 不存在 → error result 退出 0）。
+  - 千问办公对同一 chat 反复下发同一 `--session-id`，第二轮起 claude 必崩。
+- **方案**：shim 按 cwd 查 claude 会话文件 `~/.claude/projects/<cwd-slug>/<id>.jsonl` 是否存在，据此互转：
+  - `--session-id <X>` 且文件已存在 → 改推 `--resume <X>`。
+  - `--resume <X>` 且文件不存在 → 改推 `--session-id <X>`。
+  - 其余情况原样透传。
+- **cwd slug 算法**：`cwd.replace(/[^A-Za-z0-9]/g, '-')`，与 claude 自身的 projects 目录命名一致。
+- **影响**：多轮对话不再因语义冲突崩溃；shim 对会话生命周期做了轻量有状态判断（仅 `existsSync`，无写操作），不影响 claude 侧会话文件结构。
+- **何时重新考虑**：claude 修改 `--session-id`/`--resume` 语义；千问办公侧改为显式区分新建/续接（不再依赖幂等语义）。
+
+## D12：Windows 命令行长度限制规避（超长参数写入临时文件）
+
+- **问题**：Windows `CreateProcess` 命令行总长度限制 32767 字符（`cmd.exe` 包装后 8191）。shim 实测遇到 `systemPrompt` 39KB+、`mcp-config` JSON 膨胀后超限，导致 spawn 失败（`ENAMETOOLONG` 或静默截断）。
+- **方案**：
+  - `systemPrompt` / `appendSystemPrompt`：超过 200 字符时写入 `%TEMP%/qwenwork-sysprompt-<ts>-<rand>.txt`，用 `--system-prompt-file` / `--append-system-prompt-file` 传入（claude 原生支持）。
+  - `--mcp-config`：超过 100 字符时写入 `%TEMP%/qwenwork-mcp-<ts>-<rand>.json`，直接传文件路径（claude 的 `--mcp-config` 支持文件路径）。
+  - spawn 前检测命令行总长度，超 8000 字符时记日志告警并打印膨胀参数（`SPAWN-WARN` / `SPAWN-DEBUG-ARG`）。
+- **影响**：彻底规避命令行长度限制；临时文件由 OS 定期清理（`%TEMP%`）；日志可追溯每个超长参数的落盘路径。
+- **何时重新考虑**：claude 移除 `--*-file` 旗标支持；千问办公侧缩短 systemPrompt/mcp-config 长度。
+
+## D13：控制协议双向桥接（v2 方针：claude 原生 control_request 直接转发）
+
+- **问题**：v1 的 shim 拦截所有 `control_request` 并本地合成应答——claude 原生支持的能力（权限弹窗 `can_use_tool`、上下文仪表盘 `get_context_usage`、`set_model` 等）被屏蔽，成为假功能。
+- **方案**：v2 引入 `FORWARD_NATIVE` 集合（`initialize`/`set_permission_mode`/`set_model`/`get_context_usage`/`interrupt`/`stop_task`/`cancel_async_message`/`background_tasks`/`mcp_set_servers`/`mcp_toggle`/`mcp_reconnect`/`mcp_authenticate`/`apply_flag_settings`/`seed_read_state`），命中的请求直接转发给 claude，claude 的 `control_response` 原样回传 SDK。同时：
+  - claude 发出的 `control_request`（如 `can_use_tool` 权限弹窗）→ 转给 SDK，SDK 应答经 stdin 回流 claude（双向透明）。
+  - 超时/Unsupported 错误由 shim 合成兜底（`synthFor()`），避免 SDK 挂起。
+  - `initialize` 应答合并注入 `capabilities`/`skills`（claude 原生报 3 项 capabilities，SDK 用它做功能门控）。
+- **影响**：权限弹窗、上下文仪表盘、set_model 等成为真功能；shim 从"拦截自答"升级为"双向透明桥接 + 兜底合成"。
+- **何时重新考虑**：claude 新增 control_request 子类型（需加入 `FORWARD_NATIVE`）；SDK 协议 major 版本变化。
+
+## D14：黑匣子落盘（uncaughtException / unhandledRejection / stderr 完整记录）
+
+- **问题**：shim 异常退出时 `src/logs/` 无记录，无法排查现场。
+- **方案**：
+  - `process.on('uncaughtException')`：完整 stack 写入当前 logFile，100ms 后 `process.exit(1)`（给日志 flush 时间）。
+  - `process.on('unhandledRejection')`：完整 stack 写入当前 logFile。
+  - `child.stderr`：逐行写入 logFile（`STDERR` 标签），子进程退出时汇总完整 stderr（`STDERR-FULL` 标签）。
+  - spawn 异常捕获：`try/catch` 包裹 `spawn()`，失败时记 `SPAWN-FAIL` + `SPAWN-DEBUG` 并输出 stderr 摘要。
+- **影响**：任何未捕获异常、spawn 失败、子进程 stderr 均可追溯；正常路径不受影响。
+- **何时重新考虑**：日志文件过大（当前按 pid+ts 分文件，单次运行一个文件，无轮转需求）。
