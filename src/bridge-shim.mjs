@@ -12,10 +12,10 @@
 //      systemPrompt / appendSystemPrompt / promptSuggestions 翻译成 CLI 旗标
 import { spawn, execSync as _execSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { appendFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, existsSync, readFileSync, readdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join, dirname, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homedir, platform } from 'node:os';
+import { homedir, platform, tmpdir } from 'node:os';
 
 // ---------- 配置 ----------
 const DEFAULT_CLAUDE_BIN = (() => {
@@ -51,6 +51,20 @@ const logFile = join(LOG_DIR, `bridge-${process.pid}-${Date.now()}.log`);
 const log = (tag, data) => {
   try { appendFileSync(logFile, `${new Date().toISOString()} [${tag}] ${data}\n`); } catch {}
 };
+// 黑匣子：未捕获异常完整落盘（现场排查用，正常路径不受影响）
+process.on('uncaughtException', (e) => {
+  try {
+    appendFileSync(logFile, `${new Date().toISOString()} [UNCAUGHT] ${e?.stack ?? String(e)}\n`);
+  } catch {}
+  process.exitCode = 1;
+  // 给日志 flush 一点时间再退
+  setTimeout(() => process.exit(1), 100);
+});
+process.on('unhandledRejection', (e) => {
+  try {
+    appendFileSync(logFile, `${new Date().toISOString()} [UNHANDLED-REJECTION] ${e?.stack ?? String(e)}\n`);
+  } catch {}
+});
 const ledger = (entry) => {
   try { appendFileSync(LEDGER_FILE, JSON.stringify({ ts: Date.now(), ...entry }) + '\n'); } catch {}
 };
@@ -167,9 +181,40 @@ function parseArgs(argv) {
   // --yolo → claude 等效旗标（claude 不认 --yolo，实测 unknown option）
   if (flags.has('--yolo')) claudeArgs.push('--dangerously-skip-permissions');
 
-  for (const v of ['--session-id', '--resume', '--agent', '--max-budget-usd', '--max-turns',
+  for (const v of ['--agent', '--max-budget-usd', '--max-turns',
                    '--resume-session-at', '--resume-drops-turn']) {
     for (const val of all(v)) claudeArgs.push(v, val);
+  }
+  // ---- 会话语义适配（claude vs qoder 语义相反，见 D11）----
+  //   qoder: --session-id 幂等可重复、--resume 容错
+  //   claude: --session-id 仅新建（X 已存在 → already in use 退出 1）
+  //           --resume 仅续接（X 不存在 → error result 退出 0）
+  //   app 对同一 chat 反复下发同一 session-id，第二轮起必崩。
+  //   修复：按 cwd 查 claude 会话文件是否存在，据此互转。
+  {
+    const sid = first('--session-id');
+    const rid = first('--resume');
+    const cwdForSession = wd && isAbsolute(wd) ? wd : process.cwd();
+    const sessionExists = (id) => {
+      if (!id) return false;
+      const slug = cwdForSession.replace(/[^A-Za-z0-9]/g, '-');
+      const dir = join(homedir(), '.claude', 'projects', slug);
+      return existsSync(join(dir, `${id}.jsonl`));
+    };
+    if (sid && sessionExists(sid)) {
+      log('SESSION-ADAPT', `--session-id ${sid} → --resume（claude 会话已存在）`);
+      // 不推 --session-id，改推 --resume
+      claudeArgs.push('--resume', sid);
+    } else if (sid) {
+      claudeArgs.push('--session-id', sid);
+    }
+    if (rid && !sessionExists(rid)) {
+      log('SESSION-ADAPT', `--resume ${rid} → --session-id（claude 会话不存在，新建）`);
+      // 不推 --resume，改推 --session-id
+      claudeArgs.push('--session-id', rid);
+    } else if (rid) {
+      claudeArgs.push('--resume', rid);
+    }
   }
   // resume-session-at / resume-drops-turn 若以 = 形式到达也已归一为分离形式
   for (const v of ['--add-dir', '--plugin-dir']) {
@@ -180,7 +225,18 @@ function parseArgs(argv) {
   for (const val of all('--permission-prompt-tool')) claudeArgs.push('--permission-prompt-tool', val);
 
   // MCP：qw-builtin 网关必须透传（千问办公的工具通道）
-  for (const val of all('--mcp-config')) claudeArgs.push('--mcp-config', val);
+  // Windows CreateProcess 对命令行总长度有限制（32767 字符，cmd.exe 包装后 8191）
+  // JSON 转义后长度膨胀，易触发 ENAMETOOLONG → 写入临时文件，直接传路径（claude 的 --mcp-config 支持文件路径）
+  for (const val of all('--mcp-config')) {
+    if (val.length > 100) {
+      const tmpFile = join(tmpdir(), `qwenwork-mcp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
+      writeFileSync(tmpFile, val, 'utf8');
+      claudeArgs.push('--mcp-config', tmpFile);
+      log('MCP-FILE', `wrote ${val.length} chars → ${tmpFile}`);
+    } else {
+      claudeArgs.push('--mcp-config', val);
+    }
+  }
   // （--strict-mcp-config 故意丢弃：让主人既有 MCP 与 qw-builtin 共存，见 DECISIONS D5）
 
   // 权限模式：词表归一后透传
@@ -299,11 +355,32 @@ function runSession(parsed) {
 
   function spawnClaude() {
     if (child) return;
-    child = spawn(claudeCommand[0], [...claudeCommand.slice(1), ...parsed.claudeArgs], {
-      cwd: parsed.cwd,
-      env: parsed.childEnv,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    try {
+      // 检查命令行总长度，超过 8000 字符时警告
+      const cmdLineLen = parsed.claudeArgs.join(' ').length;
+      if (cmdLineLen > 8000) {
+        log('SPAWN-WARN', `命令行长度 ${cmdLineLen} 接近 Windows 限制`);
+        // 打印每个参数的长度，找出膨胀的参数
+        parsed.claudeArgs.forEach((arg, i) => {
+          if (arg.length > 100) {
+            log('SPAWN-DEBUG-ARG', `[${i}] ${arg.length} chars: ${arg.substring(0, 200)}...`);
+          }
+        });
+      }
+
+      child = spawn(claudeCommand[0], [...claudeCommand.slice(1), ...parsed.claudeArgs], {
+        cwd: parsed.cwd,
+        env: parsed.childEnv,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (e) {
+      log('SPAWN-FAIL', `${e.message} | code=${e.code} | errno=${e.errno}`);
+      log('SPAWN-DEBUG', `command=${claudeCommand[0]} | args.length=${parsed.claudeArgs.length} | cwd=${parsed.cwd}`);
+      process.stderr.write(`[qwenwork-bridge] spawn claude failed: ${e.message}\n`);
+      process.exitCode = 1;
+      try { process.stdin.destroy(); } catch {}
+      return;
+    }
     child.on('error', (e) => {
       log('ERROR', e.message);
       process.stderr.write(`[qwenwork-bridge] spawn claude failed: ${e.message}\n`);
@@ -314,7 +391,16 @@ function runSession(parsed) {
       log('EXIT', `code=${code} signal=${signal}`);
       process.exitCode = code ?? 1;
     });
-    child.stderr.on('data', (d) => { process.stderr.write(d); });
+    let stderrBuf = '';
+    child.stderr.on('data', (d) => {
+      const s = d.toString();
+      stderrBuf += s;
+      process.stderr.write(d);
+      log('STDERR', s.trim());
+    });
+    child.on('exit', () => {
+      if (stderrBuf) log('STDERR-FULL', stderrBuf.trim());
+    });
     for (const sig of ['SIGTERM', 'SIGINT']) {
       process.on(sig, () => { try { child?.kill(sig); } catch {} });
     }
@@ -361,11 +447,29 @@ function runSession(parsed) {
 
       if (subtype === 'initialize') {
         // 延迟 spawn 的意义所在：把 initialize 携带的宿主配置翻译成 CLI 旗标
-        if (req.systemPrompt !== undefined && !parsed.claudeArgs.includes('--system-prompt')) {
-          parsed.claudeArgs.push('--system-prompt', String(req.systemPrompt));
+        // systemPrompt / appendSystemPrompt 可能超长（实测 39KB+），Windows CreateProcess
+        // 命令行总长限制 32767 字符 → 超过阈值写入临时文件，用 @file 语法传入
+        if (req.systemPrompt !== undefined && !parsed.claudeArgs.includes('--system-prompt') && !parsed.claudeArgs.includes('--system-prompt-file')) {
+          const sp = String(req.systemPrompt);
+          if (sp.length > 200) {
+            const tmpFile = join(tmpdir(), `qwenwork-sysprompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+            writeFileSync(tmpFile, sp, 'utf8');
+            parsed.claudeArgs.push('--system-prompt-file', tmpFile);
+            log('SYSPROMPT-FILE', `wrote ${sp.length} chars → ${tmpFile}`);
+          } else {
+            parsed.claudeArgs.push('--system-prompt', sp);
+          }
         }
-        if (req.appendSystemPrompt !== undefined && !parsed.claudeArgs.includes('--append-system-prompt')) {
-          parsed.claudeArgs.push('--append-system-prompt', String(req.appendSystemPrompt));
+        if (req.appendSystemPrompt !== undefined && !parsed.claudeArgs.includes('--append-system-prompt') && !parsed.claudeArgs.includes('--append-system-prompt-file')) {
+          const asp = String(req.appendSystemPrompt);
+          if (asp.length > 200) {
+            const tmpFile = join(tmpdir(), `qwenwork-appendsysprompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+            writeFileSync(tmpFile, asp, 'utf8');
+            parsed.claudeArgs.push('--append-system-prompt-file', tmpFile);
+            log('APPENDSYSPROMPT-FILE', `wrote ${asp.length} chars → ${tmpFile}`);
+          } else {
+            parsed.claudeArgs.push('--append-system-prompt', asp);
+          }
         }
         if (req.promptSuggestions === true) parsed.claudeArgs.push('--prompt-suggestions', 'true');
         if (req.hooks && Object.keys(req.hooks).length > 0) log('HOOKS-DECLINED', `app hooks 不经 claude 执行: ${Object.keys(req.hooks).join(',')}`);
